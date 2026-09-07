@@ -94,6 +94,7 @@ public class LokiBuildLogsLineIterator implements LogLineIterator<Long>, AutoClo
             if (delegate.hasNext()) {
                 return delegate;
             }
+            closeDelegateQuietly();
             delegate = loadNextLogLines();
             if (!delegate.hasNext()) {
                 endOfStream = true;
@@ -203,6 +204,7 @@ public class LokiBuildLogsLineIterator implements LogLineIterator<Long>, AutoClo
                  */
                 span.setAttribute("skippedLines", -1);
                 lokiQueryParameters.setStartTimeInNanos(newStartTimeInNanos);
+                closeDelegateQuietly();
                 this.delegate = null; // TODO optimize to skip lines in the current delegate
             }
         } finally {
@@ -220,8 +222,13 @@ public class LokiBuildLogsLineIterator implements LogLineIterator<Long>, AutoClo
         return getCurrentIterator().next();
     }
 
-    @Override
-    public void close() throws Exception {
+    /**
+     * Close the current {@link #delegate}, if any and if it holds a closeable resource (eg the underlying HTTP
+     * response stream/connection of a Loki query page), before it is replaced or discarded. Each page loaded by
+     * {@link #loadNextLogLines()} holds its own HTTP response stream backed by the shared, connection pooled
+     * {@link #httpClient}; failing to close a page before moving to the next one leaks that connection.
+     */
+    private void closeDelegateQuietly() {
         if (delegate instanceof AutoCloseable) {
             try {
                 ((AutoCloseable) delegate).close();
@@ -229,6 +236,11 @@ public class LokiBuildLogsLineIterator implements LogLineIterator<Long>, AutoClo
                 logger.log(Level.WARNING, "Failed to close delegate for " + lokiQueryParameters, e);
             }
         }
+    }
+
+    @Override
+    public void close() throws Exception {
+        closeDelegateQuietly();
         try {
             this.httpClient.close();
         } catch (IOException e) {
