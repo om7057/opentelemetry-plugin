@@ -20,6 +20,7 @@ import java.util.Deque;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Optional;
+import java.util.function.Supplier;
 import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.apache.hc.client5.http.protocol.HttpClientContext;
@@ -37,9 +38,18 @@ public class LokiBuildLogsLineIteratorPageClosingTest {
     public void exhaustedPageIsClosedBeforeLoadingTheNextOne() throws Exception {
         TrackingCloseable page1Closeable = new TrackingCloseable();
         TrackingCloseable page2Closeable = new TrackingCloseable();
-        Deque<Iterator<LogLine<Long>>> pages = new ArrayDeque<>(List.of(
-                new CloseableIterator<>(List.of(new LogLine<>(1L, "line1")).iterator(), page1Closeable),
-                new CloseableIterator<>(Collections.emptyIterator(), page2Closeable)));
+        Deque<Supplier<Iterator<LogLine<Long>>>> pages = new ArrayDeque<>(List.of(
+                () -> new CloseableIterator<>(
+                        List.of(new LogLine<>(1L, "line1")).iterator(), page1Closeable),
+                () -> {
+                    // page 1 must already be closed by the time page 2 is fetched: closing it only
+                    // *eventually*, e.g. after page 2 is loaded, would still hold the pooled connection open
+                    // for longer than necessary and defeats the point of closing eagerly.
+                    assertTrue(
+                            page1Closeable.closed,
+                            "page 1 must be closed before page 2 is loaded, not merely at some later point");
+                    return new CloseableIterator<>(Collections.emptyIterator(), page2Closeable);
+                }));
 
         try (TestableLokiBuildLogsLineIterator iterator = new TestableLokiBuildLogsLineIterator(pages)) {
             assertTrue(iterator.hasNext());
@@ -56,7 +66,7 @@ public class LokiBuildLogsLineIteratorPageClosingTest {
     @Test
     public void currentPageIsClosedWhenSkipLinesDiscardsIt() throws Exception {
         TrackingCloseable page1Closeable = new TrackingCloseable();
-        Deque<Iterator<LogLine<Long>>> pages = new ArrayDeque<>(List.of(
+        Deque<Supplier<Iterator<LogLine<Long>>>> pages = new ArrayDeque<>(List.of(() ->
                 new CloseableIterator<>(List.of(new LogLine<>(1L, "line1")).iterator(), page1Closeable)));
 
         try (TestableLokiBuildLogsLineIterator iterator = new TestableLokiBuildLogsLineIterator(pages)) {
@@ -82,9 +92,9 @@ public class LokiBuildLogsLineIteratorPageClosingTest {
      * Serves pre-built pages instead of querying a real Loki server.
      */
     private static class TestableLokiBuildLogsLineIterator extends LokiBuildLogsLineIterator {
-        private final Deque<Iterator<LogLine<Long>>> pages;
+        private final Deque<Supplier<Iterator<LogLine<Long>>>> pages;
 
-        TestableLokiBuildLogsLineIterator(Deque<Iterator<LogLine<Long>>> pages) {
+        TestableLokiBuildLogsLineIterator(Deque<Supplier<Iterator<LogLine<Long>>>> pages) {
             super(
                     new LokiGetJenkinsBuildLogsQueryParametersBuilder()
                             .setJobFullName("my-war/master")
@@ -106,7 +116,9 @@ public class LokiBuildLogsLineIteratorPageClosingTest {
 
         @Override
         protected Iterator<LogLine<Long>> loadNextLogLines() {
-            return pages.isEmpty() ? Collections.emptyIterator() : pages.removeFirst();
+            return pages.isEmpty()
+                    ? Collections.emptyIterator()
+                    : pages.removeFirst().get();
         }
 
         // The real client is never used since loadNextLogLines() is overridden, but close() still calls
